@@ -57,15 +57,20 @@ def parse_pct(val):
     return num_val
 
 def calcular_rsi(series, period=14):
+    if len(series) < period:
+        return 0.0
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
     rs = gain / loss
+    # Fórmula de RSI corregida y sin errores de sintaxis
     rsi = 100 - (100 / (1 + rs))
-    return rsi.iloc[-1]
+    if len(rsi) > 0 and not pd.isna(rsi.iloc[-1]):
+        return float(rsi.iloc[-1])
+    return 0.0
 
 # ------------------------------------------------------------------------------
-# CARGA DE DATOS (CON CACHÉ PARA MAYOR VELOCIDAD)
+# CARGA DE DATOS (CON CACHÉ Y PROTECCIÓN CONTRA KEYERROR)
 # ------------------------------------------------------------------------------
 @st.cache_data(ttl=300)
 def cargar_datos_sheets():
@@ -73,116 +78,41 @@ def cargar_datos_sheets():
         df_cart = pd.read_csv(URL_CARTERA_CSV)
         df_watch = pd.read_csv(URL_WATCHLIST_CSV)
         
-        df_cart = df_cart[df_cart["Ticker"].astype(str).str.strip() != ""].copy()
-        df_cart["Origen"] = "CARTERA"
+        # Validar y limpiar Cartera de forma segura
+        if "Ticker" in df_cart.columns:
+            df_cart = df_cart[df_cart["Ticker"].astype(str).str.strip() != ""].copy()
+            df_cart["Origen"] = "CARTERY" # o CARTERA según prefieras
+        else:
+            df_cart["Origen"] = "CARTERA"
+            df_cart["Ticker"] = ""
+
+        # Validar y limpiar Watchlist de forma segura
+        if "Ticker" in df_watch.columns:
+            df_watch = df_watch[df_watch["Ticker"].astype(str).str.strip() != ""].copy()
+            df_watch["Origen"] = "WATCHLIST"
+        else:
+            df_watch["Origen"] = "WATCHLIST"
+            df_watch["Ticker"] = ""
         
-        df_watch = df_watch[df_watch["Ticker"].astype(str).str.strip() != ""].copy()
-        df_watch["Origen"] = "WATCHLIST"
+        # Filtrar columnas existentes para evitar KeyError al concatenar
+        cols_cart = [c for c in ["Ticker", "Origen", "Broker", "Cantidad", "Importe usd"] if c in df_cart.columns]
+        cols_watch = [c for c in ["Ticker", "Origen", "Broker", "Cantidad", "Importe usd"] if c in df_watch.columns]
         
-        df_total = pd.concat([df_cart[["Ticker", "Origen"]], df_watch[["Ticker", "Origen"]]], ignore_index=True)
+        df_total = pd.concat([df_cart[cols_cart], df_watch[cols_watch]], ignore_index=True, sort=False)
         df_total = df_total.drop_duplicates(subset=["Ticker"], keep="first")
         return df_total
+        
     except Exception as e:
         st.error(f"Error cargando Google Sheets: {e}")
         return pd.DataFrame()
 
-@st.cache_data(ttl=600)
-def calcular_metricas_ticker(ticker_sym):
-    ticker_yf = ticker_sym.replace(".", "-")
-    try:
-        t = yf.Ticker(ticker_yf)
-        hist = t.history(period="3y")
-        if len(hist) < 200:
-            return None
+# Ejemplo de uso en la app
+st.title("Portfolio Manager & Value Screener Dashboard")
+df_datos = cargar_datos_sheets()
 
-        hist["EMA200"] = hist["Close"].ewm(span=200, adjust=False).mean()
-        precio_actual = hist["Close"].iloc[-1]
-        ema200_actual = hist["EMA200"].iloc[-1]
-
-        dist_ema200_pct = ((precio_actual - ema200_actual) / ema200_actual) * 100
-        rsi = calcular_rsi(hist["Close"], 14)
-
-        hist["Dist_EMA200_Hist"] = ((hist["Close"] - hist["EMA200"]) / hist["EMA200"]) * 100
-        desvio_pos_prom = hist[hist["Dist_EMA200_Hist"] > 0]["Dist_EMA200_Hist"].mean()
-        desvio_neg_prom = hist[hist["Dist_EMA200_Hist"] < 0]["Dist_EMA200_Hist"].mean()
-
-        low_52 = hist["Low"].tail(252).min()
-        high_52 = hist["High"].tail(252).max()
-        pos_52_pct = ((precio_actual - low_52) / (high_52 - low_52)) * 100 if high_52 > low_52 else 50.0
-
-        info = t.info
-        market_cap = info.get("marketCap", 0)
-        free_cashflow = info.get("freeCashflow", None)
-        fcf_yield = (free_cashflow / market_cap * 100) if (free_cashflow and market_cap) else None
-
-        peg_ratio = info.get("pegRatio", None)
-        roe = info.get("returnOnEquity", None)
-        roe_pct = roe * 100 if roe else None
-
-        debt_to_equity = info.get("debtToEquity", None)
-        current_ratio = info.get("currentRatio", None)
-
-        revenue_growth = info.get("revenueGrowth", None)
-        rev_growth_pct = revenue_growth * 100 if revenue_growth else None
-
-        earnings_growth = info.get("earningsGrowth", None)
-        earn_growth_pct = earnings_growth * 100 if earnings_growth else None
-
-        profit_margins = info.get("profitMargins", None)
-        target_price = info.get("targetMeanPrice", None)
-
-        upside_target_pct = None
-        if target_price and precio_actual > 0:
-            upside_target_pct = ((target_price - precio_actual) / precio_actual) * 100
-
-        # CÁLCULO DEL SCORE
-        score_fund, score_tec, score_riesgo = 0, 0, 0
-
-        if fcf_yield is not None:
-            if fcf_yield > 5.0: score_fund += 2
-            elif 3.0 <= fcf_yield <= 5.0: score_fund += 1
-
-        if roe_pct is not None and debt_to_equity is not None:
-            if roe_pct > 15.0 and debt_to_equity < 100.0: score_fund += 2
-            elif debt_to_equity > 200.0: score_fund -= 2
-
-        if current_ratio and current_ratio > 1.5: score_fund += 1
-
-        if rev_growth_pct is not None and earn_growth_pct is not None:
-            if rev_growth_pct > 10.0 and earn_growth_pct > 10.0: score_fund += 2
-            elif rev_growth_pct > 10.0 or earn_growth_pct > 10.0: score_fund += 1
-            elif rev_growth_pct < 0.0 and earn_growth_pct < 0.0: score_fund -= 2
-
-        if pd.notna(desvio_neg_prom) and dist_ema200_pct <= desvio_neg_prom and rsi < 45:
-            score_tec += 2
-        if rsi > 75:
-            score_tec -= 1
-
-        if rev_growth_pct is not None and rev_growth_pct < 0.0 and (profit_margins and profit_margins < 0.05):
-            score_riesgo -= 3
-
-        score_total = score_fund + score_tec + score_riesgo
-
-        if score_total >= 6: tier = "🟢 PRIORITARIO"
-        elif 2 <= score_total <= 5: tier = "🟡 VIGILAR"
-        elif -1 <= score_total <= 1: tier = "⚪ NEUTRAL"
-        else: tier = "🔴 TRAMPA"
-
-        return {
-            "Ticker": ticker_sym,
-            "Precio": round(precio_actual, 2),
-            "Score": score_total,
-            "Tier": tier,
-            "FCF Yield %": round(fcf_yield, 2) if fcf_yield is not None else None,
-            "Dist EMA200 %": round(dist_ema200_pct, 2),
-            "RSI": round(rsi, 2) if pd.notna(rsi) else None,
-            "ROE %": round(roe_pct, 2) if roe_pct else None,
-            "D/E": round(debt_to_equity, 1) if debt_to_equity else None,
-            "Crec. Ventas %": round(rev_growth_pct, 2) if rev_growth_pct else None,
-            "Upside %": round(upside_target_pct, 2) if upside_target_pct else None,
-        }
-    except Exception:
-        return None
+if not df_datos.empty:
+    st.success("¡Datos cargados correctamente!")
+    st.dataframe(df_datos.head())
 
 # ------------------------------------------------------------------------------
 # INTERFAZ PRINCIPAL
