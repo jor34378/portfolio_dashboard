@@ -25,7 +25,7 @@ URL_WATCHLIST_CSV = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRbLGRdor-T
 URL_RESULTADO_CSV = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRbLGRdor-TtNOtkqL0cbrTnUN0mg6-FLM-3yAxuZsznZRUJjeqoyWC7ZubG6kp1SEgYvcryTnb1eyE/pub?gid=264036849&single=true&output=csv"
 
 # ------------------------------------------------------------------------------
-# FUNCIONES AUXILIARES DE LIMPIEZA
+# FUNCIONES AUXILIARES DE LIMPIEZA Y MÉTRICAS
 # ------------------------------------------------------------------------------
 def parse_num(val):
     if pd.isna(val) or val is None:
@@ -63,11 +63,42 @@ def calcular_rsi(series, period=14):
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
     rs = gain / loss
-    # Fórmula de RSI corregida y sin errores de sintaxis
     rsi = 100 - (100 / (1 + rs))
     if len(rsi) > 0 and not pd.isna(rsi.iloc[-1]):
         return float(rsi.iloc[-1])
     return 0.0
+
+def calcular_metricas_ticker(ticker):
+    """Calcula métricas básicas de mercado y un score de ejemplo usando yfinance"""
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period="6mo")
+        if hist.empty:
+            return None
+        
+        precio_actual = hist["Close"].iloc[-1]
+        rsi_val = calcular_rsi(hist["Close"])
+        
+        # Obtener info fundamental básica de manera segura
+        info = t.info
+        pe = info.get("trailingPE", 0.0)
+        if pe is None: 
+            pe = 0.0
+            
+        # Simulación de un Score y Tier básico para que el screener no falle
+        score = max(0, min(100, 50 - (pe if pe > 0 else 20) + (100 - rsi_val) * 0.2))
+        tier = "Tier 1" if score > 60 else ("Tier 2" if score > 40 else "Tier 3")
+        
+        return {
+            "Ticker": ticker,
+            "Precio": round(precio_actual, 2),
+            "P/E": round(float(pe), 2),
+            "RSI": round(rsi_val, 2),
+            "Score": round(score, 2),
+            "Tier": tier
+        }
+    except Exception:
+        return None
 
 # ------------------------------------------------------------------------------
 # CARGA DE DATOS (CON CACHÉ Y PROTECCIÓN CONTRA KEYERROR)
@@ -81,7 +112,7 @@ def cargar_datos_sheets():
         # Validar y limpiar Cartera de forma segura
         if "Ticker" in df_cart.columns:
             df_cart = df_cart[df_cart["Ticker"].astype(str).str.strip() != ""].copy()
-            df_cart["Origen"] = "CARTERY" # o CARTERA según prefieras
+            df_cart["Origen"] = "CARTERA"
         else:
             df_cart["Origen"] = "CARTERA"
             df_cart["Ticker"] = ""
@@ -105,14 +136,6 @@ def cargar_datos_sheets():
     except Exception as e:
         st.error(f"Error cargando Google Sheets: {e}")
         return pd.DataFrame()
-
-# Ejemplo de uso en la app
-st.title("Portfolio Manager & Value Screener Dashboard")
-df_datos = cargar_datos_sheets()
-
-if not df_datos.empty:
-    st.success("¡Datos cargados correctamente!")
-    st.dataframe(df_datos.head())
 
 # ------------------------------------------------------------------------------
 # INTERFAZ PRINCIPAL
@@ -141,8 +164,12 @@ with tab1:
                 bar.progress((idx + 1) / len(tickers), text=f"Evaluando {t}...")
             bar.empty()
             
-            df_res = pd.DataFrame(resultados)
-            st.session_state["df_screener"] = df_res
+            if resultados:
+                df_res = pd.DataFrame(resultados)
+                st.session_state["df_screener"] = df_res
+                st.success("¡Métricas calculadas con éxito!")
+            else:
+                st.warning("No se pudieron obtener métricas para los tickers de las listas.")
 
     if "df_screener" in st.session_state:
         df = st.session_state["df_screener"]
@@ -192,7 +219,6 @@ with tab3:
     
     if st.button("📊 Generar Análisis"):
         st.write(f"Procesando gráfico y checklist fundamental para **{ticker_input}**...")
-        # Aquí Streamlit mostrará el gráfico de Matplotlib directamente
         t_obj = yf.Ticker(ticker_input)
         hist = t_obj.history(period="2y")
         if not hist.empty:
