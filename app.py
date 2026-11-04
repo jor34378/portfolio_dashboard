@@ -229,11 +229,10 @@ with tab3:
     ticker_input = st.text_input("Ingresa un Ticker para analizar:", value="AAPL").upper()
     
     if st.button("📊 Generar Análisis"):
-        with st.spinner(fB"Buscando datos para {ticker_input}..."):
+        with st.spinner(f"Buscando datos para {ticker_input}..."):
             t_obj = yf.Ticker(ticker_input)
             hist = t_obj.history(period="2y")
             if hist.empty and "." not in ticker_input:
-                # Intentar sufijo local por si acaso
                 t_obj = yf.Ticker(f"{ticker_input}.BA")
                 hist = t_obj.history(period="2y")
                 
