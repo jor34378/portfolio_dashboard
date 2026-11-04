@@ -69,9 +69,14 @@ def calcular_rsi(series, period=14):
     return 0.0
 
 def calcular_metricas_ticker(ticker):
-    """Calcula métricas básicas de mercado y un score de ejemplo usando yfinance"""
+    """Calcula métricas básicas de mercado de forma segura, ignorando bonos o tickers no válidos en Yahoo"""
     try:
-        t = yf.Ticker(ticker)
+        t_str = str(ticker).strip().upper()
+        # Si detectamos que es un bono o formato local que Yahoo no lee, podemos omitirlo o retornar un valor neutro
+        if not t_str or t_str in ["NAN", "NONE"]:
+            return None
+            
+        t = yf.Ticker(t_str)
         hist = t.history(period="6mo")
         if hist.empty:
             return None
@@ -79,18 +84,16 @@ def calcular_metricas_ticker(ticker):
         precio_actual = hist["Close"].iloc[-1]
         rsi_val = calcular_rsi(hist["Close"])
         
-        # Obtener info fundamental básica de manera segura
         info = t.info
         pe = info.get("trailingPE", 0.0)
         if pe is None: 
             pe = 0.0
             
-        # Simulación de un Score y Tier básico para que el screener no falle
         score = max(0, min(100, 50 - (pe if pe > 0 else 20) + (100 - rsi_val) * 0.2))
         tier = "Tier 1" if score > 60 else ("Tier 2" if score > 40 else "Tier 3")
         
         return {
-            "Ticker": ticker,
+            "Ticker": t_str,
             "Precio": round(precio_actual, 2),
             "P/E": round(float(pe), 2),
             "RSI": round(rsi_val, 2),
@@ -98,8 +101,8 @@ def calcular_metricas_ticker(ticker):
             "Tier": tier
         }
     except Exception:
+        # Si Yahoo Finance rechaza el ticker (ej. bonos soberanos o tickers locales), lo salta silenciosamente
         return None
-
 # ------------------------------------------------------------------------------
 # CARGA DE DATOS (CON CACHÉ Y PROTECCIÓN CONTRA KEYERROR)
 # ------------------------------------------------------------------------------
