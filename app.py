@@ -345,30 +345,199 @@ with tab2:
         st.error(f"Error al cargar la hoja de resultados: {e}")
 
 # ------------------------------- TAB 3 ----------------------------------------
-with tab3:
-    st.subheader("Generador de Dashboard por Ticker")
-    ticker_input = normalizar_ticker(st.text_input("Ingresá un Ticker para analizar:", value="AAPL"))
+# ------------------------------------------------------------------------------
+# FUNCIONES DE ANÁLISIS AVANZADO POR TICKER (Estilo Telegram /pe)
+# ------------------------------------------------------------------------------
+def generar_dashboard_grafico(ticker_str: str, d_bajo: float, d_medio: float, d_alto: float):
+    ticker_symbol = ticker_str.strip().upper().replace(".", "-")
+    ticker_obj = yf.Ticker(ticker_symbol)
+    
+    try:
+        earnings_data = ticker_obj.get_earnings_dates(limit=50)
+    except Exception:
+        earnings_data = None
 
-    if st.button("📊 Generar Análisis") and ticker_input:
-        with st.spinner(f"Buscando datos para {ticker_input}..."):
-            fila, hist = analizar(ticker_input, period="2y")
-        if fila is None:
-            st.session_state.pop("analisis", None)
-            st.warning("No se encontraron datos históricos para este ticker en Yahoo Finance.")
+    if earnings_data is None or earnings_data.empty:
+        return None, "No se encontraron fechas de ganancias / EPS para este ticker en Yahoo Finance."
+
+    try:
+        df_eps = earnings_data[['Reported EPS']].dropna().copy()
+        df_eps = df_eps.sort_index()
+        df_eps.index = df_eps.index.date
+        df_eps.index.name = 'Fecha de Reporte'
+        df_eps.columns = ['EPS Reportado']
+        df_eps = df_eps.reset_index()
+        df_eps["Fecha de Reporte"] = pd.to_datetime(df_eps["Fecha de Reporte"]).dt.normalize()
+        df_eps["EPS Reportado"] = df_eps["EPS Reportado"].astype(float)
+        df_eps = df_eps.sort_values("Fecha de Reporte")
+        df_eps["eps_ttm"] = df_eps["EPS Reportado"].rolling(window=4).sum()
+
+        df_eps["desvio_bajo"] = d_bajo
+        df_eps["desvio_medio"] = d_medio
+        df_eps["desvio_alto"] = d_alto
+
+        df_eps["Precio_bajo"] = df_eps["desvio_bajo"] * df_eps["eps_ttm"]
+        df_eps["Precio_medio"] = df_eps["desvio_medio"] * df_eps["eps_ttm"]
+        df_eps["Precio_alto"] = df_eps["desvio_alto"] * df_eps["eps_ttm"]
+
+        benchmark = "SPY"
+        start_date = "2020-01-01"
+        data_raw = yf.download([ticker_symbol, benchmark], start=start_date, auto_adjust=True, progress=False)
+
+        if isinstance(data_raw.columns, pd.MultiIndex):
+            prices = data_raw['Close'][ticker_symbol].to_frame(name='Close')
+            spy_prices = data_raw['Close'][benchmark]
         else:
-            st.session_state["analisis"] = {"ticker": ticker_input, "fila": fila, "hist": hist}
+            prices = data_raw[['Close']].copy()
+            spy_prices = data_raw['Close']
 
-    if "analisis" in st.session_state:
-        a = st.session_state["analisis"]
-        fila = a["fila"]
-        if fila["Símbolo Yahoo"] != a["ticker"]:
-            st.warning(f"No se encontró {a['ticker']}; se usó {fila['Símbolo Yahoo']} "
-                       "(precio probablemente en pesos).")
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Precio", fila["Precio"])
-        m2.metric("RSI (14)", fila["RSI"] if fila["RSI"] is not None else "s/d")
-        m3.metric("vs SMA200", f"{fila['vs SMA200 %']}%" if fila["vs SMA200 %"] is not None else "s/d")
-        m4.metric("P/E", fila["P/E"] if fila["P/E"] is not None else "s/d")
-        m5.metric("Tier", fila["Tier"])
-        graficar(a["ticker"], a["hist"])
-        mostrar_df(pd.DataFrame([fila]))
+        df_union = df_eps.set_index("Fecha de Reporte")
+        df = prices.join(df_union[['eps_ttm', 'Precio_bajo', 'Precio_medio', 'Precio_alto']])
+        cols_interp = ['eps_ttm', 'Precio_bajo', 'Precio_medio', 'Precio_alto']
+        df[cols_interp] = df[cols_interp].interpolate(method='linear').ffill().bfill()
+
+        df['RSI'] = rsi_serie(df['Close'])
+        df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
+        df['Disp_200'] = ((df['Close'] - df['EMA200']) / df['EMA200']) * 100
+        d_avg_pos = df['Disp_200'][df['Disp_200'] > 0].mean()
+        d_avg_neg = df['Disp_200'][df['Disp_200'] < 0].mean()
+        df['RS'] = df['Close'] / spy_prices
+        df['RS_SMA'] = df['RS'].rolling(window=50).mean()
+
+        plt.style.use("dark_background")
+        fig, (ax1, ax2, ax3, ax4) = plt.subplots(
+            4, 1, figsize=(11, 13), sharex=True,
+            gridspec_kw={'height_ratios': [2.5, 1, 1, 1]}, dpi=150
+        )
+
+        # Panel 1: Precio y Bandas de P/E
+        ax1.plot(df.index, df['Close'], color='#38bdf8', lw=1.5, label=f'Precio {ticker_symbol}')
+        ax1.plot(df.index, df['Precio_medio'], color='#facc15', ls='--', alpha=0.8, label=f'P/E Medio ({d_medio:.1f}x)')
+        ax1.fill_between(df.index, df['Precio_bajo'], df['Precio_alto'], color='#94a3b8', alpha=0.15, label='Zona de Valor (Bandas P/E)')
+        ax1.set_title(f"Dashboard P/E & Multi-Panel: {ticker_symbol}", fontsize=13, fontweight='bold', color='#f8fafc', pad=10)
+        ax1.legend(loc='upper left', fontsize='small', facecolor='#1e293b', edgecolor='#334155')
+        ax1.grid(True, alpha=0.2)
+
+        # Panel 2: Fuerza Relativa vs SPY
+        ax2.plot(df.index, df['RS'], color='#818cf8', label='RS vs SPY')
+        ax2.plot(df.index, df['RS_SMA'], color='#fb923c', ls=':', label='RS SMA 50')
+        ax2.fill_between(df.index, df['RS'], df['RS_SMA'], where=(df['RS'] > df['RS_SMA']), color='#4ade80', alpha=0.2)
+        ax2.set_ylabel("Fuerza Rel.", fontsize=9)
+        ax2.legend(loc='upper left', fontsize='x-small', facecolor='#1e293b', edgecolor='#334155')
+        ax2.grid(True, alpha=0.2)
+
+        # Panel 3: Dispersión respecto a la EMA 200
+        ax3.plot(df.index, df['Disp_200'], color='#c084fc', lw=1)
+        ax3.axhline(0, color='#94a3b8', lw=0.8)
+        ax3.axhline(d_avg_pos, color='#4ade80', ls='--', alpha=0.5)
+        ax3.axhline(d_avg_neg, color='#f87171', ls='--', alpha=0.5)
+        ax3.fill_between(df.index, df['Disp_200'], 0, where=(df['Disp_200']>=0), color='#4ade80', alpha=0.1)
+        ax3.fill_between(df.index, df['Disp_200'], 0, where=(df['Disp_200']<0), color='#f87171', alpha=0.1)
+        ax3.set_ylabel("% Disp. EMA200", fontsize=9)
+        ax3.grid(True, alpha=0.2)
+
+        # Panel 4: RSI (14)
+        ax4.plot(df.index, df['RSI'], color='#2dd4bf', lw=1)
+        ax4.axhline(70, color='#f87171', ls='--', alpha=0.4)
+        ax4.axhline(30, color='#4ade80', ls='--', alpha=0.4)
+        ax4.set_ylim(0, 100)
+        ax4.set_ylabel("RSI (14)", fontsize=9)
+        ax4.grid(True, alpha=0.2)
+
+        plt.tight_layout()
+
+        image_stream = io.BytesIO()
+        plt.savefig(image_stream, format="png", bbox_inches="tight", facecolor="#0f172a")
+        image_stream.seek(0)
+        plt.close(fig)
+
+        pe_actual = df['Close'].iloc[-1] / df['eps_ttm'].iloc[-1] if df['eps_ttm'].iloc[-1] > 0 else 0
+        rsi_act = df['RSI'].iloc[-1]
+        disp_act = df['Disp_200'].iloc[-1]
+        rs_lidera = df['RS'].iloc[-1] > df['RS_SMA'].iloc[-1]
+
+        status_txt = {
+            "pe": pe_actual,
+            "rsi": rsi_act,
+            "disp": disp_act,
+            "d_neg": d_avg_neg,
+            "rs_lidera": rs_lidera
+        }
+
+        return image_stream, status_txt
+    except Exception as e:
+        return None, f"Error procesando datos históricos/EPS: {str(e)}"
+
+def check_pm_pro(ticker_str: str):
+    try:
+        asset = yf.Ticker(ticker_str)
+        info = asset.info
+        fin = asset.financials.T
+        cf = asset.cashflow.T
+
+        price = info.get('currentPrice') or info.get('regularMarketPrice') or 1
+        target = info.get('targetMeanPrice', price)
+        upside = ((target - price) / price) * 100 if target else 0
+
+        rev_now = fin['Total Revenue'].iloc[0] if 'Total Revenue' in fin.columns and len(fin) > 0 else None
+        rev_prev = fin['Total Revenue'].iloc[1] if 'Total Revenue' in fin.columns and len(fin) > 1 else None
+        
+        # Función auxiliar de crecimiento porcentual
+        def crecimiento_pct(a, b):
+            return ((a - b) / abs(b)) * 100 if a is not None and b is not None and b != 0 else None
+
+        rev_growth = crecimiento_pct(rev_now, rev_prev)
+
+        fcf_now, fcf_prev = None, None
+        if 'Free Cash Flow' in cf.columns and len(cf) > 1:
+            fcf_now, fcf_prev = cf['Free Cash Flow'].iloc[0], cf['Free Cash Flow'].iloc[1]
+        elif 'Operating Cash Flow' in cf.columns and 'Capital Expenditure' in cf.columns and len(cf) > 1:
+            fcf_now = cf['Operating Cash Flow'].iloc[0] + cf['Capital Expenditure'].iloc[0]
+            fcf_prev = cf['Operating Cash Flow'].iloc[1] + cf['Capital Expenditure'].iloc[1]
+
+        fcf_growth = crecimiento_pct(fcf_now, fcf_prev)
+
+        ebitda = info.get('ebitda', 0)
+        total_debt = info.get('totalDebt', 0)
+        total_cash = info.get('totalCash', 0)
+        
+        nd_ebitda = (total_debt - total_cash) / ebitda if ebitda and ebitda > 0 else None
+        roe = (info.get('returnOnEquity') or 0) * 100
+        peg = info.get('pegRatio', 0) or 0
+
+        score = 0
+        st_rev = "❌"
+        if rev_growth is not None and rev_growth > 0: score += 20; st_rev = "✅"
+
+        st_fcf = "❌"
+        if fcf_growth is not None and fcf_growth > 0: score += 20; st_fcf = "✅"
+
+        st_roe = "❌"
+        if roe > 15: score += 20; st_roe = "✅"
+
+        st_debt = "❌"
+        if nd_ebitda is not None and nd_ebitda < 2.5: score += 20; st_debt = "✅"
+        elif nd_ebitda is None: st_debt = "⚪ (N/A)"
+
+        st_peg = "🟡"
+        if 0 < peg < 2.0: score += 10; st_peg = "✅"
+
+        st_up = "🟡"
+        if upside > 15: score += 10; st_up = "✅"
+
+        if score >= 85: veredicto = "💎 MUY ATRACTIVO: Activo premium con todo a favor."
+        elif 65 <= score < 85: veredicto = "✅ ATRACTIVO: Sólido, buscar confirmación técnica."
+        elif 45 <= score < 65: veredicto = "🟡 NEUTRAL: Ver evolución de márgenes o deuda."
+        else: veredicto = "🚨 EVITAR: Fundamentos débiles o riesgo alto."
+
+        return {
+            "rev_growth": rev_growth, "st_rev": st_rev,
+            "fcf_growth": fcf_growth, "st_fcf": st_fcf,
+            "roe": roe, "st_roe": st_roe,
+            "nd_ebitda": nd_ebitda, "st_debt": st_debt,
+            "peg": peg, "st_peg": st_peg,
+            "upside": upside, "st_up": st_up,
+            "score": score, "veredicto": veredicto
+        }
+    except Exception:
+        return None
