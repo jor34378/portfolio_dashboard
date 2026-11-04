@@ -25,7 +25,7 @@ URL_WATCHLIST_CSV = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRbLGRdor-T
 URL_RESULTADO_CSV = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRbLGRdor-TtNOtkqL0cbrTnUN0mg6-FLM-3yAxuZsznZRUJjeqoyWC7ZubG6kp1SEgYvcryTnb1eyE/pub?gid=264036849&single=true&output=csv"
 
 # ------------------------------------------------------------------------------
-# FUNCIONES AUXILIARES DE LIMPIEZA Y MÉTRICAS
+# FUNCIONES AUXILIARES DE LIMPIEZA Y CÁLCULO
 # ------------------------------------------------------------------------------
 def parse_num(val):
     if pd.isna(val) or val is None:
@@ -44,18 +44,6 @@ def parse_num(val):
     except ValueError:
         return 0.0
 
-def parse_pct(val):
-    if pd.isna(val) or val is None:
-        return 0.0
-    val_str = str(val).strip()
-    tiene_signo_pct = "%" in val_str
-    num_val = parse_num(val_str.replace("%", ""))
-    if tiene_signo_pct:
-        return num_val
-    if -1.0 <= num_val <= 1.0 and num_val != 0:
-        return num_val * 100.0
-    return num_val
-
 def calcular_rsi(series, period=14):
     if len(series) < period:
         return 0.0
@@ -69,42 +57,49 @@ def calcular_rsi(series, period=14):
     return 0.0
 
 def calcular_metricas_ticker(ticker):
-    """Calcula métricas básicas de mercado de forma segura, ignorando bonos o tickers no válidos en Yahoo"""
-    try:
-        t_str = str(ticker).strip().upper()
-        # Si detectamos que es un bono o formato local que Yahoo no lee, podemos omitirlo o retornar un valor neutro
-        if not t_str or t_str in ["NAN", "NONE"]:
-            return None
-            
-        t = yf.Ticker(t_str)
-        hist = t.history(period="6mo")
-        if hist.empty:
-            return None
-        
-        precio_actual = hist["Close"].iloc[-1]
-        rsi_val = calcular_rsi(hist["Close"])
-        
-        info = t.info
-        pe = info.get("trailingPE", 0.0)
-        if pe is None: 
-            pe = 0.0
-            
-        score = max(0, min(100, 50 - (pe if pe > 0 else 20) + (100 - rsi_val) * 0.2))
-        tier = "Tier 1" if score > 60 else ("Tier 2" if score > 40 else "Tier 3")
-        
-        return {
-            "Ticker": t_str,
-            "Precio": round(precio_actual, 2),
-            "P/E": round(float(pe), 2),
-            "RSI": round(rsi_val, 2),
-            "Score": round(score, 2),
-            "Tier": tier
-        }
-    except Exception:
-        # Si Yahoo Finance rechaza el ticker (ej. bonos soberanos o tickers locales), lo salta silenciosamente
+    """Obtiene métricas de Yahoo Finance de forma ultra segura probando variantes si es necesario"""
+    t_str = str(ticker).strip().upper()
+    if not t_str or t_str in ["NAN", "NONE"]:
         return None
+    
+    # Intentar con el ticker original y variantes si es local (.BA)
+    intentos = [t_str]
+    if "." not in t_str and len(t_str) <= 5:
+        intentos.append(f"{t_str}.BA")
+        
+    for symbol in intentos:
+        try:
+            t = yf.Ticker(symbol)
+            hist = t.history(period="6mo")
+            if hist.empty:
+                continue
+            
+            precio_actual = hist["Close"].iloc[-1]
+            rsi_val = calcular_rsi(hist["Close"])
+            
+            info = t.info
+            pe = info.get("trailingPE", 0.0)
+            if pe is None: 
+                pe = 0.0
+                
+            score = max(0, min(100, 50 - (pe if pe > 0 else 20) + (100 - rsi_val) * 0.2))
+            tier = "Tier 1" if score > 60 else ("Tier 2" if score > 40 else "Tier 3")
+            
+            return {
+                "Ticker": t_str,
+                "Precio": round(precio_actual, 2),
+                "P/E": round(float(pe), 2),
+                "RSI": round(rsi_val, 2),
+                "Score": round(score, 2),
+                "Tier": tier
+            }
+        except Exception:
+            continue
+            
+    return None
+
 # ------------------------------------------------------------------------------
-# CARGA DE DATOS (CON CACHÉ Y PROTECCIÓN CONTRA KEYERROR)
+# CARGA DE DATOS (CON CACHÉ)
 # ------------------------------------------------------------------------------
 @st.cache_data(ttl=300)
 def cargar_datos_sheets():
@@ -112,7 +107,6 @@ def cargar_datos_sheets():
         df_cart = pd.read_csv(URL_CARTERA_CSV)
         df_watch = pd.read_csv(URL_WATCHLIST_CSV)
         
-        # Validar y limpiar Cartera de forma segura
         if "Ticker" in df_cart.columns:
             df_cart = df_cart[df_cart["Ticker"].astype(str).str.strip() != ""].copy()
             df_cart["Origen"] = "CARTERA"
@@ -120,7 +114,6 @@ def cargar_datos_sheets():
             df_cart["Origen"] = "CARTERA"
             df_cart["Ticker"] = ""
 
-        # Validar y limpiar Watchlist de forma segura
         if "Ticker" in df_watch.columns:
             df_watch = df_watch[df_watch["Ticker"].astype(str).str.strip() != ""].copy()
             df_watch["Origen"] = "WATCHLIST"
@@ -128,12 +121,22 @@ def cargar_datos_sheets():
             df_watch["Origen"] = "WATCHLIST"
             df_watch["Ticker"] = ""
         
-        # Filtrar columnas existentes para evitar KeyError al concatenar
-        cols_cart = [c for c in ["Ticker", "Origen", "Broker", "Cantidad", "Importe usd"] if c in df_cart.columns]
-        cols_watch = [c for c in ["Ticker", "Origen", "Broker", "Cantidad", "Importe usd"] if c in df_watch.columns]
+        cols_base = ["Ticker", "Origen", "Broker", "Cantidad", "Importe usd", "Cat", "Especie"]
+        cols_cart = [c for c in cols_base if c in df_cart.columns]
+        cols_watch = [c for c in cols_base if c in df_watch.columns]
         
         df_total = pd.concat([df_cart[cols_cart], df_watch[cols_watch]], ignore_index=True, sort=False)
         df_total = df_total.drop_duplicates(subset=["Ticker"], keep="first")
+        
+        def clasificar_mercado(row):
+            cat = str(row.get("Cat", "")).upper()
+            ticker = str(row["Ticker"]).upper()
+            if "USA" in cat or "CEDEAR" in cat or "." not in ticker:
+                return "Acciones US / Internacionales"
+            else:
+                return "Resto / Local"
+                
+        df_total["Mercado"] = df_total.apply(clasificar_mercado, axis=1)
         return df_total
         
     except Exception as e:
@@ -162,7 +165,11 @@ with tab1:
             for idx, t in enumerate(tickers):
                 m = calcular_metricas_ticker(str(t).strip())
                 if m:
-                    m["Origen"] = df_base.loc[df_base["Ticker"] == t, "Origen"].values[0]
+                    # Heredar metadatos originales
+                    orig = df_base.loc[df_base["Ticker"] == t, "Origen"].values[0]
+                    merc = df_base.loc[df_base["Ticker"] == t, "Mercado"].values[0]
+                    m["Origen"] = orig
+                    m["Mercado"] = merc
                     resultados.append(m)
                 bar.progress((idx + 1) / len(tickers), text=f"Evaluando {t}...")
             bar.empty()
@@ -172,23 +179,24 @@ with tab1:
                 st.session_state["df_screener"] = df_res
                 st.success("¡Métricas calculadas con éxito!")
             else:
-                st.warning("No se pudieron obtener métricas para los tickers de las listas.")
+                st.warning("No se pudieron obtener métricas de Yahoo para los tickers listados (verifica si son bonos o requieren sufijo).")
 
     if "df_screener" in st.session_state:
         df = st.session_state["df_screener"]
 
-        # Filtros de la Barra Lateral / Arriba
-        col_f1, col_f2, col_f3 = st.columns(3)
+        col_f1, col_f2, col_f3, col_f4 = st.columns(4)
         with col_f1:
             filtro_origen = st.multiselect("Origen:", options=df["Origen"].unique(), default=df["Origen"].unique())
         with col_f2:
-            filtro_tier = st.multiselect("Clasificación (Tier):", options=df["Tier"].unique(), default=df["Tier"].unique())
+            filtro_mercado = st.multiselect("Mercado:", options=df["Mercado"].unique(), default=df["Mercado"].unique())
         with col_f3:
+            filtro_tier = st.multiselect("Tier:", options=df["Tier"].unique(), default=df["Tier"].unique())
+        with col_f4:
             buscar_ticker = st.text_input("Buscar Ticker:", "").upper()
 
-        # Filtrar DataFrame
         df_filtrado = df[
             (df["Origen"].isin(filtro_origen)) &
+            (df["Mercado"].isin(filtro_mercado)) &
             (df["Tier"].isin(filtro_tier))
         ]
         if buscar_ticker:
@@ -221,14 +229,19 @@ with tab3:
     ticker_input = st.text_input("Ingresa un Ticker para analizar:", value="AAPL").upper()
     
     if st.button("📊 Generar Análisis"):
-        st.write(f"Procesando gráfico y checklist fundamental para **{ticker_input}**...")
-        t_obj = yf.Ticker(ticker_input)
-        hist = t_obj.history(period="2y")
-        if not hist.empty:
-            fig, ax = plt.subplots(figsize=(10, 4))
-            ax.plot(hist.index, hist["Close"], label="Precio de Cierre", color="#38bdf8")
-            ax.set_title(f"Evolución de Precio: {ticker_input}")
-            ax.grid(True, alpha=0.3)
-            st.pyplot(fig)
-        else:
-            st.warning("No se encontraron datos históricos para este ticker.")
+        with st.spinner(fB"Buscando datos para {ticker_input}..."):
+            t_obj = yf.Ticker(ticker_input)
+            hist = t_obj.history(period="2y")
+            if hist.empty and "." not in ticker_input:
+                # Intentar sufijo local por si acaso
+                t_obj = yf.Ticker(f"{ticker_input}.BA")
+                hist = t_obj.history(period="2y")
+                
+            if not hist.empty:
+                fig, ax = plt.subplots(figsize=(10, 4))
+                ax.plot(hist.index, hist["Close"], label="Precio de Cierre", color="#38bdf8")
+                ax.set_title(f"Evolución de Precio: {ticker_input}")
+                ax.grid(True, alpha=0.3)
+                st.pyplot(fig)
+            else:
+                st.warning("No se encontraron datos históricos para este ticker en Yahoo Finance.")
